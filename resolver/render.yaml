@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: timecut-resolver
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: API_KEY
+        generateValue: true

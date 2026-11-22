@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "timecut-mp3",
+  "main": ".svelte-kit/cloudflare/_worker.js",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "binding": "ASSETS",
+    "directory": ".svelte-kit/cloudflare"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    // Supported modes: "custom" (included resolver/server.py), "cobalt", or "piped"
+    "MEDIA_RESOLVER_TYPE": "custom"
+    // Set MEDIA_RESOLVER_URL and optional MEDIA_RESOLVER_API_KEY via:
+    //   npx wrangler secret put MEDIA_RESOLVER_URL
+    //   npx wrangler secret put MEDIA_RESOLVER_API_KEY
+    // Or locally in .dev.vars (see .dev.vars.example)
+  }
+}

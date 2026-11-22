@@ -1,0 +1,16 @@
+# Copy this file to .dev.vars for local Cloudflare Worker development (`npm run dev` or `npm run cf:preview`)
+# In production, set these with:
+#   npx wrangler secret put MEDIA_RESOLVER_URL
+#   npx wrangler secret put MEDIA_RESOLVER_API_KEY
+
+# Resolver type: "custom" (included resolver/server.py) | "cobalt" | "piped"
+MEDIA_RESOLVER_TYPE=custom
+
+# URL of your audio stream resolver service:
+# - custom: e.g. http://localhost:8080/audio or https://timecut-resolver.onrender.com/audio
+# - cobalt: e.g. https://your-cobalt-instance.example.com
+# - piped:  e.g. https://your-piped-api.example.com
+MEDIA_RESOLVER_URL=
+
+# Optional API key / Bearer token sent to your resolver
+MEDIA_RESOLVER_API_KEY=
