@@ -4,7 +4,12 @@ Tiny single-user yt-dlp audio streaming resolver for TimeCut.
 - Zero external Python web frameworks (stdlib http.server + yt-dlp CLI)
 - Streams audio bytes straight to stdout -> Cloudflare Worker (no disk buffering)
 - Protected by optional API_KEY (Authorization: Bearer <API_KEY>)
-- Supports optional base64-encoded cookies via YTDLP_COOKIES_B64 if a cloud IP hits YouTube bot checks
+- Supports cookies from:
+    1) YTDLP_COOKIES_PATH env var
+    2) /etc/secrets/cookies.txt (Render Secret Files — easiest, no base64 needed)
+    3) YTDLP_COOKIES env var (raw Netscape cookies.txt text)
+    4) YTDLP_COOKIES_B64 env var (base64-encoded cookies.txt)
+- Automatically retries alternate YouTube player clients if a cloud IP hits a bot check
 """
 
 import base64
@@ -21,18 +26,42 @@ PORT = int(os.environ.get("PORT", "8080"))
 API_KEY = os.environ.get("API_KEY", "").strip()
 VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 
-# Optionally materialize base64-encoded Netscape cookies.txt once at startup
-COOKIES_PATH = None
-cookies_b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
-if cookies_b64:
-    try:
-        raw_cookies = base64.b64decode(cookies_b64)
+
+def resolve_cookies_path() -> str | None:
+    # 1. Explicit file path
+    explicit = os.environ.get("YTDLP_COOKIES_PATH", "").strip()
+    if explicit and os.path.isfile(explicit):
+        return explicit
+
+    # 2. Render Secret File default path
+    render_secret = "/etc/secrets/cookies.txt"
+    if os.path.isfile(render_secret):
+        return render_secret
+
+    # 3. Raw Netscape cookies text in env var
+    raw_text = os.environ.get("YTDLP_COOKIES", "").strip()
+    if raw_text:
         tmp = tempfile.NamedTemporaryFile(prefix="yt_cookies_", suffix=".txt", delete=False)
-        tmp.write(raw_cookies)
+        tmp.write(raw_text.encode("utf-8"))
         tmp.close()
-        COOKIES_PATH = tmp.name
-    except Exception as exc:
-        print(f"[resolver] Warning: failed to decode YTDLP_COOKIES_B64: {exc}", flush=True)
+        return tmp.name
+
+    # 4. Base64-encoded cookies.txt in env var
+    cookies_b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+    if cookies_b64:
+        try:
+            raw_bytes = base64.b64decode(cookies_b64)
+            tmp = tempfile.NamedTemporaryFile(prefix="yt_cookies_", suffix=".txt", delete=False)
+            tmp.write(raw_bytes)
+            tmp.close()
+            return tmp.name
+        except Exception as exc:
+            print(f"[resolver] Warning: failed to decode YTDLP_COOKIES_B64: {exc}", flush=True)
+
+    return None
+
+
+COOKIES_PATH = resolve_cookies_path()
 
 
 def extract_video_id(query: dict[str, list[str]]) -> str | None:
@@ -54,6 +83,43 @@ def extract_video_id(query: dict[str, list[str]]) -> str | None:
             return parts[1]
 
     return None
+
+
+def spawn_ytdlp(youtube_url: str, player_client: str | None = None) -> tuple[subprocess.Popen, bytes, str]:
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "--quiet",
+        "-f",
+        "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+        "-o",
+        "-",
+    ]
+    if COOKIES_PATH:
+        cmd.extend(["--cookies", COOKIES_PATH])
+    if player_client:
+        cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
+
+    cmd.append(youtube_url)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stdout is not None and proc.stderr is not None
+
+    first_chunk = proc.stdout.read(65536)
+    if first_chunk:
+        return proc, first_chunk, ""
+
+    err_msg = proc.stderr.read().decode("utf-8", errors="replace").strip()
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        proc.kill()
+    return proc, b"", err_msg
 
 
 class ResolverHandler(BaseHTTPRequestHandler):
@@ -102,38 +168,30 @@ class ResolverHandler(BaseHTTPRequestHandler):
 
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        # Prefer m4a/webm audio-only track so download is small and fast for FFmpeg.wasm
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--no-warnings",
-            "--quiet",
-            "-f",
-            "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
-            "-o",
-            "-",
-            youtube_url,
-        ]
-        if COOKIES_PATH:
-            cmd[1:1] = ["--cookies", COOKIES_PATH]
+        # Try default client first; if a cloud IP triggers YouTube's bot check, fall back to
+        # alternate player clients that sometimes bypass unauthenticated datacenter blocks.
+        attempts: list[str | None] = [None]
+        if not COOKIES_PATH:
+            attempts.extend(["android_vr", "tv_embedded", "ios"])
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        proc = None
+        first_chunk = b""
+        last_err = ""
 
-        assert proc.stdout is not None and proc.stderr is not None
+        for client in attempts:
+            proc, first_chunk, last_err = spawn_ytdlp(youtube_url, player_client=client)
+            if first_chunk:
+                break
+            # Only retry alternate clients on bot/sign-in/player failures
+            lower = last_err.lower()
+            if not ("not a bot" in lower or "sign in" in lower or "requested format" in lower):
+                break
 
-        # Read the first chunk before sending HTTP 200 so yt-dlp errors return a proper 502 JSON error
-        first_chunk = proc.stdout.read(65536)
-        if not first_chunk:
-            err_msg = proc.stderr.read().decode("utf-8", errors="replace").strip()
-            proc.wait(timeout=10)
+        if not first_chunk or proc is None or proc.stdout is None:
             return self._send_json(
                 502,
                 {
-                    "error": err_msg[:300] or "yt-dlp failed to extract an audio stream for this video."
+                    "error": last_err[:360] or "yt-dlp failed to extract an audio stream for this video."
                 },
             )
 
@@ -173,7 +231,8 @@ class ResolverHandler(BaseHTTPRequestHandler):
         finally:
             try:
                 proc.stdout.close()
-                proc.stderr.close()
+                if proc.stderr:
+                    proc.stderr.close()
                 proc.wait(timeout=5)
             except Exception:
                 proc.kill()
@@ -184,5 +243,8 @@ class ResolverHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("0.0.0.0", PORT), ResolverHandler)
-    print(f"[resolver] Listening on 0.0.0.0:{PORT} (auth={'on' if API_KEY else 'off'})", flush=True)
+    print(
+        f"[resolver] Listening on 0.0.0.0:{PORT} (auth={'on' if API_KEY else 'off'}, cookies={'on' if COOKIES_PATH else 'off'})",
+        flush=True,
+    )
     server.serve_forever()
