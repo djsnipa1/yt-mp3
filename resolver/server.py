@@ -228,6 +228,57 @@ class ResolverHandler(BaseHTTPRequestHandler):
                 },
             )
 
+        if parsed.path == "/debug":
+            if not self._check_auth():
+                return self._send_json(401, {"error": "Unauthorized"})
+            query = parse_qs(parsed.query)
+            video_id = extract_video_id(query) or "dQw4w9WgXcQ"
+            youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+            cmd = [
+                "yt-dlp",
+                "-v",
+                "--simulate",
+                "--no-playlist",
+                "--js-runtimes",
+                "node",
+                "-f",
+                "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+            ]
+            if COOKIES_PATH:
+                cmd.extend(["--cookies", COOKIES_PATH])
+            cmd.append(youtube_url)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+            combined = (res.stdout + "\n" + res.stderr).splitlines()
+            # Keep the most informative yt-dlp lines without leaking raw cookie values
+            filtered = [
+                line
+                for line in combined
+                if any(
+                    tok in line
+                    for tok in (
+                        "yt-dlp version",
+                        "JS runtimes",
+                        "PO Token",
+                        "[pot",
+                        "[youtube]",
+                        "WARNING:",
+                        "ERROR:",
+                        "player_client",
+                    )
+                )
+            ]
+            return self._send_json(
+                200,
+                {
+                    "exitCode": res.returncode,
+                    "videoId": video_id,
+                    "potServerReady": is_bgutil_alive(),
+                    "cookiesCount": COOKIES_COUNT,
+                    "hasYoutubeAuthCookies": HAS_YOUTUBE_AUTH,
+                    "logs": filtered[-60:],
+                },
+            )
+
         if parsed.path != "/audio":
             return self._send_json(404, {"error": "Not found. Use GET /audio?id=<videoId>"})
 
@@ -266,10 +317,11 @@ class ResolverHandler(BaseHTTPRequestHandler):
                 break
 
         if not first_chunk or proc is None or proc.stdout is None:
+            print(f"[resolver] Extraction failed for {video_id}: {last_err}", flush=True)
             return self._send_json(
                 502,
                 {
-                    "error": last_err[:360] or "yt-dlp failed to extract an audio stream for this video."
+                    "error": last_err[:500] or "yt-dlp failed to extract an audio stream for this video."
                 },
             )
 
