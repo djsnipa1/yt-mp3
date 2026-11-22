@@ -1,67 +1,125 @@
 #!/usr/bin/env python3
 """
 Tiny single-user yt-dlp audio streaming resolver for TimeCut.
-- Zero external Python web frameworks (stdlib http.server + yt-dlp CLI)
+- Runs the bundled bgutil PO-token HTTP server on 127.0.0.1:4416 (for cloud IPs like Render)
+- Copies cookies into a writable /tmp file (Render mounts /etc/secrets/ read-only)
+- Validates whether exported cookies contain YouTube auth tokens (reported on /health)
 - Streams audio bytes straight to stdout -> Cloudflare Worker (no disk buffering)
 - Protected by optional API_KEY (Authorization: Bearer <API_KEY>)
-- Supports cookies from:
-    1) YTDLP_COOKIES_PATH env var
-    2) /etc/secrets/cookies.txt (Render Secret Files — easiest, no base64 needed)
-    3) YTDLP_COOKIES env var (raw Netscape cookies.txt text)
-    4) YTDLP_COOKIES_B64 env var (base64-encoded cookies.txt)
-- Automatically retries alternate YouTube player clients if a cloud IP hits a bot check
 """
 
+import atexit
 import base64
 import hmac
 import json
 import os
 import re
+import socket
 import subprocess
 import tempfile
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 PORT = int(os.environ.get("PORT", "8080"))
 API_KEY = os.environ.get("API_KEY", "").strip()
 VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+AUTH_COOKIE_NAMES = {"LOGIN_INFO", "SAPISID", "__Secure-3PAPISID", "SID", "HSID"}
+
+BGUTIL_MAIN = "/opt/bgutil/build/main.js"
+BGUTIL_PORT = 4416
 
 
-def resolve_cookies_path() -> str | None:
-    # 1. Explicit file path
+def start_bgutil_server() -> subprocess.Popen | None:
+    """Start the local bgutil PO-token HTTP server on 127.0.0.1:4416 if bundled."""
+    if not os.path.isfile(BGUTIL_MAIN):
+        return None
+
+    proc = subprocess.Popen(
+        ["node", BGUTIL_MAIN, "--host", "127.0.0.1", "--port", str(BGUTIL_PORT)],
+        cwd="/opt/bgutil",
+    )
+
+    def cleanup():
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+
+    atexit.register(cleanup)
+
+    # Wait briefly for port 4416 to start accepting connections
+    for _ in range(25):
+        if proc.poll() is not None:
+            print(f"[resolver] Warning: bgutil exited early with code {proc.returncode}", flush=True)
+            return None
+        try:
+            with socket.create_connection(("127.0.0.1", BGUTIL_PORT), timeout=0.2):
+                print(f"[resolver] bgutil PO-token server ready on 127.0.0.1:{BGUTIL_PORT}", flush=True)
+                return proc
+        except OSError:
+            time.sleep(0.2)
+
+    print("[resolver] bgutil server started (still warming up)", flush=True)
+    return proc
+
+
+def load_writable_cookies() -> tuple[str | None, int, bool]:
+    """
+    Loads cookies from YTDLP_COOKIES_PATH, /etc/secrets/cookies.txt, YTDLP_COOKIES,
+    or YTDLP_COOKIES_B64, normalizes line endings, writes to a writable /tmp file,
+    and returns (writable_path, cookie_row_count, has_youtube_auth_cookies).
+    """
+    raw_text: str | None = None
+
     explicit = os.environ.get("YTDLP_COOKIES_PATH", "").strip()
     if explicit and os.path.isfile(explicit):
-        return explicit
-
-    # 2. Render Secret File default path
-    render_secret = "/etc/secrets/cookies.txt"
-    if os.path.isfile(render_secret):
-        return render_secret
-
-    # 3. Raw Netscape cookies text in env var
-    raw_text = os.environ.get("YTDLP_COOKIES", "").strip()
-    if raw_text:
-        tmp = tempfile.NamedTemporaryFile(prefix="yt_cookies_", suffix=".txt", delete=False)
-        tmp.write(raw_text.encode("utf-8"))
-        tmp.close()
-        return tmp.name
-
-    # 4. Base64-encoded cookies.txt in env var
-    cookies_b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
-    if cookies_b64:
+        with open(explicit, "r", encoding="utf-8", errors="replace") as f:
+            raw_text = f.read()
+    elif os.path.isfile("/etc/secrets/cookies.txt"):
+        with open("/etc/secrets/cookies.txt", "r", encoding="utf-8", errors="replace") as f:
+            raw_text = f.read()
+    elif os.environ.get("YTDLP_COOKIES", "").strip():
+        raw_text = os.environ.get("YTDLP_COOKIES", "")
+    elif os.environ.get("YTDLP_COOKIES_B64", "").strip():
         try:
-            raw_bytes = base64.b64decode(cookies_b64)
-            tmp = tempfile.NamedTemporaryFile(prefix="yt_cookies_", suffix=".txt", delete=False)
-            tmp.write(raw_bytes)
-            tmp.close()
-            return tmp.name
+            raw_text = base64.b64decode(os.environ["YTDLP_COOKIES_B64"].strip()).decode(
+                "utf-8", errors="replace"
+            )
         except Exception as exc:
             print(f"[resolver] Warning: failed to decode YTDLP_COOKIES_B64: {exc}", flush=True)
 
-    return None
+    if not raw_text or not raw_text.strip():
+        return None, 0, False
+
+    # Normalize Windows CRLF -> LF and ensure Netscape header exists
+    normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+    if not normalized.startswith("# Netscape HTTP Cookie File") and not normalized.startswith("# HTTP Cookie File"):
+        normalized = "# Netscape HTTP Cookie File\n" + normalized
+
+    cookie_rows = 0
+    has_yt_auth = False
+    for line in normalized.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        cols = line.split("\t")
+        if len(cols) >= 7:
+            cookie_rows += 1
+            domain = cols[0].lower()
+            name = cols[5]
+            if "youtube.com" in domain and name in AUTH_COOKIE_NAMES:
+                has_yt_auth = True
+
+    tmp = tempfile.NamedTemporaryFile(prefix="yt_cookies_", suffix=".txt", delete=False)
+    tmp.write(normalized.encode("utf-8"))
+    tmp.close()
+    return tmp.name, cookie_rows, has_yt_auth
 
 
-COOKIES_PATH = resolve_cookies_path()
+BGUTIL_PROC = start_bgutil_server()
+COOKIES_PATH, COOKIES_COUNT, HAS_YOUTUBE_AUTH = load_writable_cookies()
 
 
 def extract_video_id(query: dict[str, list[str]]) -> str | None:
@@ -85,12 +143,24 @@ def extract_video_id(query: dict[str, list[str]]) -> str | None:
     return None
 
 
+def is_bgutil_alive() -> bool:
+    if BGUTIL_PROC is None or BGUTIL_PROC.poll() is not None:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", BGUTIL_PORT), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
 def spawn_ytdlp(youtube_url: str, player_client: str | None = None) -> tuple[subprocess.Popen, bytes, str]:
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "--no-warnings",
         "--quiet",
+        "--js-runtimes",
+        "node",
         "-f",
         "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
         "-o",
@@ -152,6 +222,9 @@ class ResolverHandler(BaseHTTPRequestHandler):
                     "service": "timecut-resolver",
                     "authRequired": bool(API_KEY),
                     "cookiesConfigured": bool(COOKIES_PATH),
+                    "cookiesCount": COOKIES_COUNT,
+                    "hasYoutubeAuthCookies": HAS_YOUTUBE_AUTH,
+                    "potServerReady": is_bgutil_alive(),
                 },
             )
 
@@ -168,11 +241,12 @@ class ResolverHandler(BaseHTTPRequestHandler):
 
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        # Try default client first; if a cloud IP triggers YouTube's bot check, fall back to
-        # alternate player clients that sometimes bypass unauthenticated datacenter blocks.
-        attempts: list[str | None] = [None]
-        if not COOKIES_PATH:
-            attempts.extend(["android_vr", "tv_embedded", "ios"])
+        # Try default client (which uses bgutil PO-token provider + cookies),
+        # then fall back through mobile/TV clients if YouTube blocks the first one.
+        if COOKIES_PATH:
+            attempts: list[str | None] = [None, "mweb,tv", "web_safari"]
+        else:
+            attempts = [None, "mweb,tv", "android_vr", "tv_embedded"]
 
         proc = None
         first_chunk = b""
@@ -182,9 +256,13 @@ class ResolverHandler(BaseHTTPRequestHandler):
             proc, first_chunk, last_err = spawn_ytdlp(youtube_url, player_client=client)
             if first_chunk:
                 break
-            # Only retry alternate clients on bot/sign-in/player failures
             lower = last_err.lower()
-            if not ("not a bot" in lower or "sign in" in lower or "requested format" in lower):
+            if not (
+                "not a bot" in lower
+                or "sign in" in lower
+                or "requested format" in lower
+                or "po token" in lower
+            ):
                 break
 
         if not first_chunk or proc is None or proc.stdout is None:
@@ -244,7 +322,8 @@ class ResolverHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("0.0.0.0", PORT), ResolverHandler)
     print(
-        f"[resolver] Listening on 0.0.0.0:{PORT} (auth={'on' if API_KEY else 'off'}, cookies={'on' if COOKIES_PATH else 'off'})",
+        f"[resolver] Listening on 0.0.0.0:{PORT} "
+        f"(auth={'on' if API_KEY else 'off'}, cookies={COOKIES_COUNT}, yt_auth={HAS_YOUTUBE_AUTH}, pot={is_bgutil_alive()})",
         flush=True,
     )
     server.serve_forever()
